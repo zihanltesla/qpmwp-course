@@ -451,7 +451,7 @@ def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> No
 
     jkp = bs.data.jkp_data[features].groupby(['date', 'id']).last()
     prices = bs.data.market_data.pivot_table(index='date', columns='id', values='price')
-    fwd = prices.pct_change(horizon).shift(-horizon)
+    fwd = prices.pct_change(horizon, fill_method=None).shift(-horizon)
     fwd = fwd.stack().rename('target')
 
     df = jkp.join(fwd, how='inner').dropna()
@@ -470,6 +470,8 @@ def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> No
     last_date = jkp.index.get_level_values('date').unique()
     last_date = last_date[last_date < pd.to_datetime(rebdate)].max()
     test = jkp.xs(last_date, level='date')[features].dropna()
+    if test.empty:
+        return
     preds = pd.Series(model.predict(test), index=test.index)
 
     bs.optimization_data['predicted_returns'] = preds

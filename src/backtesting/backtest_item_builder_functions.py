@@ -24,6 +24,28 @@ import xgboost as xgb
 # Backtest item builder functions (bibfn) - Selection
 # --------------------------------------------------------------------------
 
+
+def bibfn_selection_factor_zscore(bs: 'BacktestService', rebdate: str, **kwargs) -> pd.Series:
+    """
+    使用 z-score 对因子筛选，返回选中的股票（二值向量）。
+    例如：筛选 ret_6_1 z-score > 1 的动量股票。
+    """
+    field = kwargs.get("field", "ret_6_1")
+    threshold = kwargs.get("threshold", 1.0)
+
+    jkp = bs.data.jkp_data.copy()
+    df = jkp[[field]].groupby(["date", "id"]).last()
+    df = df[df.index.get_level_values("date") < pd.to_datetime(rebdate)]
+    df = df.groupby("id").last()
+
+    # z-score 筛选
+    scores = df[field]
+    zscores = (scores - scores.mean()) / scores.std()
+    binary = (zscores > threshold).astype(int)
+
+    return binary.rename("binary")
+
+
 def bibfn_selection_min_volume(bs, rebdate: str, **kwargs) -> pd.DataFrame:
 
     '''
@@ -441,14 +463,16 @@ def bibfn_scores_ltr(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
 
 
 def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
-    """Optimization data & Machine Learning Prediction requirement."""
+    """Optimization data & Machine Learning Prediction requirement with XGBoost."""
 
-    from sklearn.linear_model import LinearRegression
+    from xgboost import XGBRegressor
+    import pandas as pd
 
     width = kwargs.get('width', 252 * 5)
     horizon = kwargs.get('horizon', 21)
     features = kwargs.get('features', ['ret_6_1', 'ret_12_1', 'niq_su'])
 
+    # 1. 获取特征与 forward return
     jkp = bs.data.jkp_data[features].groupby(['date', 'id']).last()
     prices = bs.data.market_data.pivot_table(index='date', columns='id', values='price')
     fwd = prices.pct_change(horizon).shift(-horizon)
@@ -460,21 +484,36 @@ def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> No
     if df_train.empty:
         return
 
+    # 2. 构建训练数据
     X_train = df_train[features]
     y_train = df_train['target']
     mask = X_train.notna().all(axis=1)
     X_train = X_train[mask]
     y_train = y_train[mask]
-    model = LinearRegression().fit(X_train, y_train)
 
+    # 3. 拟合 XGBoost 回归模型
+    model = XGBRegressor(
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.1,
+        objective='reg:squarederror',
+        verbosity=0
+    )
+    model.fit(X_train, y_train)
+
+    # 4. 获取最新特征，生成预测
     last_date = jkp.index.get_level_values('date').unique()
     last_date = last_date[last_date < pd.to_datetime(rebdate)].max()
     test = jkp.xs(last_date, level='date')[features].dropna()
+
+    if test.empty:
+        return
+
     preds = pd.Series(model.predict(test), index=test.index)
 
+    # 5. 存入优化器
     bs.optimization_data['predicted_returns'] = preds
     bs.optimization.expected_return.vector = preds
-    return None
 
 
 
@@ -483,6 +522,36 @@ def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> No
 # --------------------------------------------------------------------------
 # Backtest item builder functions - Optimization constraints
 # --------------------------------------------------------------------------
+
+
+def bibfn_sector_upper_bounds(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
+    sector_upper = kwargs.get('sector_upper', 0.25)
+
+    # 获取某日的 market_data
+    data = bs.data.market_data.copy()
+    date_data = data[data.index.get_level_values("date") == pd.to_datetime(rebdate)]
+
+    # 如果 'id' 是 index 而非列，则 reset_index
+    if "id" not in date_data.columns:
+        date_data = date_data.reset_index()
+
+    if "sector" not in date_data.columns:
+        raise ValueError("market_data 中缺少 'sector' 列，无法使用行业约束。")
+
+    # 创建 sector_map：id -> sector
+    sector_map = date_data.set_index("id")["sector"].dropna()
+
+    grouped = sector_map.groupby(sector_map).groups
+
+    for sector, ids in grouped.items():
+        bs.optimization.constraints.add_group_upper(
+            name=f"sector_{sector}",
+            ids=list(ids),
+            upper=sector_upper
+        )
+    return None
+
+
 
 def bibfn_budget_constraint(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
 

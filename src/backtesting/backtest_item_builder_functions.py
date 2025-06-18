@@ -463,19 +463,17 @@ def bibfn_scores_ltr(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
 
 
 def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
-    """Optimization data & Machine Learning Prediction requirement with XGBoost."""
+    """Optimization data & Machine Learning Prediction requirement."""
 
-    from xgboost import XGBRegressor
-    import pandas as pd
+    from sklearn.linear_model import LinearRegression
 
     width = kwargs.get('width', 252 * 5)
     horizon = kwargs.get('horizon', 21)
     features = kwargs.get('features', ['ret_6_1', 'ret_12_1', 'niq_su'])
 
-    # 1. 获取特征与 forward return
     jkp = bs.data.jkp_data[features].groupby(['date', 'id']).last()
     prices = bs.data.market_data.pivot_table(index='date', columns='id', values='price')
-    fwd = prices.pct_change(horizon).shift(-horizon)
+    fwd = prices.pct_change(horizon, fill_method=None).shift(-horizon)
     fwd = fwd.stack().rename('target')
 
     df = jkp.join(fwd, how='inner').dropna()
@@ -484,36 +482,23 @@ def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> No
     if df_train.empty:
         return
 
-    # 2. 构建训练数据
     X_train = df_train[features]
     y_train = df_train['target']
     mask = X_train.notna().all(axis=1)
     X_train = X_train[mask]
     y_train = y_train[mask]
-
-    # 3. 拟合 XGBoost 回归模型
-    model = XGBRegressor(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.1,
-        objective='reg:squarederror',
-        verbosity=0
-    )
-    model.fit(X_train, y_train)
-
-    # 4. 获取最新特征，生成预测
+    model = LinearRegression().fit(X_train, y_train)
     last_date = jkp.index.get_level_values('date').unique()
     last_date = last_date[last_date < pd.to_datetime(rebdate)].max()
     test = jkp.xs(last_date, level='date')[features].dropna()
-
     if test.empty:
         return
-
     preds = pd.Series(model.predict(test), index=test.index)
 
-    # 5. 存入优化器
     bs.optimization_data['predicted_returns'] = preds
     bs.optimization.expected_return.vector = preds
+    return None
+
 
 
 

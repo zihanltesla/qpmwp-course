@@ -220,6 +220,44 @@ def bibfn_selection_jkp_factor_scores(bs, rebdate: str, **kwargs) -> pd.DataFram
     return filter_values
 
 
+def bibfn_selection_high_volatility(bs, rebdate: str, **kwargs) -> pd.DataFrame:
+    """Selection requirement: exclude high volatility stocks."""
+
+    width = kwargs.get('width', 252)
+    threshold = kwargs.get('threshold', 0.04)
+
+    vol = bs.data.get_return_series(end_date=rebdate, width=width).std()
+    filt = (vol <= threshold).astype(int)
+
+    filter_values = pd.DataFrame({
+        'values': vol,
+        'binary': filt,
+    }, index=vol.index)
+
+    return filter_values
+
+
+def bibfn_selection_quality(bs, rebdate: str, **kwargs) -> pd.DataFrame:
+    """Selection requirement: exclude low quality stocks using JKP factors."""
+
+    field = kwargs.get('field', 'qmj')
+    threshold = kwargs.get('threshold', 0.0)
+
+    df = bs.data.jkp_data[[field]].groupby(['date', 'id']).last()
+    df = df[df.index.get_level_values('date') < rebdate]
+    df = df.groupby('id').last()
+
+    quality = df[field]
+    filt = (quality >= threshold).astype(int)
+
+    filter_values = pd.DataFrame({
+        'values': quality,
+        'binary': filt,
+    }, index=quality.index)
+
+    return filter_values
+
+
 
 
 
@@ -399,6 +437,43 @@ def bibfn_scores_ltr(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
         'ret': pd.Series(df_test['ret'].values, index=df_test['id']),
     }, axis=1)
     bs.optimization_data['scores'] = scores
+    return None
+
+
+def bibfn_predicted_returns(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
+    """Optimization data & Machine Learning Prediction requirement."""
+
+    from sklearn.linear_model import LinearRegression
+
+    width = kwargs.get('width', 252 * 5)
+    horizon = kwargs.get('horizon', 21)
+    features = kwargs.get('features', ['ret_6_1', 'ret_12_1', 'niq_su'])
+
+    jkp = bs.data.jkp_data[features].groupby(['date', 'id']).last()
+    prices = bs.data.market_data.pivot_table(index='date', columns='id', values='price')
+    fwd = prices.pct_change(horizon).shift(-horizon)
+    fwd = fwd.stack().rename('target')
+
+    df = jkp.join(fwd, how='inner').dropna()
+    df_train = df[df.index.get_level_values('date') < rebdate].tail(width)
+
+    if df_train.empty:
+        return
+
+    X_train = df_train[features]
+    y_train = df_train['target']
+    mask = X_train.notna().all(axis=1)
+    X_train = X_train[mask]
+    y_train = y_train[mask]
+    model = LinearRegression().fit(X_train, y_train)
+
+    last_date = jkp.index.get_level_values('date').unique()
+    last_date = last_date[last_date < pd.to_datetime(rebdate)].max()
+    test = jkp.xs(last_date, level='date')[features].dropna()
+    preds = pd.Series(model.predict(test), index=test.index)
+
+    bs.optimization_data['predicted_returns'] = preds
+    bs.optimization.expected_return.vector = preds
     return None
 
 
